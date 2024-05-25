@@ -5,8 +5,9 @@ import time
 import psutil  # For getting RAM and CPU info
 import multiprocessing
 from prettytable import PrettyTable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import platform
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
 
 BROADCAST_PORT = 12345
 TCP_PORT = 54321
@@ -137,7 +138,7 @@ def discover_slaves():
             time.sleep(DISCOVERY_INTERVAL)
 
 
-def assign_ranges_to_slave(slave_ip, start, end):
+async def assign_ranges_to_slave(slave_ip, start, end):
     with open(PRIMES_FILE, 'a') as f:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -166,12 +167,13 @@ def assign_ranges_to_slave(slave_ip, start, end):
                 return None
 
 
-def calculate_primes_master(start, end):
+async def calculate_primes_master(start, end):
+    loop = asyncio.get_event_loop()
     start_time = time.time()
-    with multiprocessing.Pool() as pool:
+    with ProcessPoolExecutor() as pool:
         step = (end - start) // multiprocessing.cpu_count() + 1
         tasks = [(max(start, i), min(end, i + step - 1)) for i in range(start, end + 1, step)]
-        results = pool.starmap(sieve_of_eratosthenes, tasks)
+        results = await asyncio.gather(*[loop.run_in_executor(pool, sieve_of_eratosthenes, t[0], t[1]) for t in tasks])
         primes = [prime for sublist in results for prime in sublist]
     end_time = time.time()
     execution_time = end_time - start_time
@@ -205,28 +207,37 @@ def handle_user_input():
             start_calculations.set()
 
 
-def distribute_workload(current, executor):
-    futures = []
+async def distribute_workload(current):
+    pending_tasks = {}
     while not start_calculations.is_set():
-        time.sleep(1)
+        await asyncio.sleep(1)
+
     while True:
         with lock:
             for slave_ip, info in slaves.items():
                 if not start_calculations.is_set():
                     break
-                batch_size = info['batch_size']
-                start = current
-                end = start + batch_size - 1
-                futures.append(executor.submit(assign_ranges_to_slave, slave_ip, start, end))
-                current = end + 1
+                if pending_tasks.get(slave_ip, 0) < 4:  # Limit of 4 batches per slave
+                    batch_size = info['batch_size']
+                    start = current
+                    end = start + batch_size - 1
+                    pending_tasks.setdefault(slave_ip, 0)
+                    pending_tasks[slave_ip] += 1
+                    asyncio.create_task(assign_ranges_to_slave(slave_ip, start, end))
+                    current = end + 1
+
         if server_calculations:
-            futures.append(executor.submit(calculate_primes_master, current, current + INITIAL_BATCH_SIZE - 1))
-        for future in as_completed(futures):
-            if future.exception() is None:
-                result = future.result()
-                if result is not None:
-                    current = result
-            futures.remove(future)
+            future_master_batch = asyncio.create_task(calculate_primes_master(current, current + INITIAL_BATCH_SIZE - 1))
+            result = await future_master_batch
+            if result is not None:
+                current = result
+
+        # Update task count based on completed tasks
+        for slave_ip in list(pending_tasks):
+            if pending_tasks[slave_ip] == 0:
+                del pending_tasks[slave_ip]
+
+        await asyncio.sleep(1)  # Small sleep to prevent tight loop
 
 
 def start_master():
@@ -235,8 +246,7 @@ def start_master():
     threading.Thread(target=handle_user_input).start()
 
     current = 2
-    with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count() + len(slaves)) as executor:
-        distribute_workload(current, executor)
+    asyncio.run(distribute_workload(current))
 
 
 def broadcast_and_serve_slave():
