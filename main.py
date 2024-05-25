@@ -19,6 +19,7 @@ HANDSHAKE_PORT = 54322
 slaves = {}
 lock = threading.Lock()
 start_calculations = threading.Event()
+server_calculations = False  # New flag to determine if server should perform calculations
 
 
 def get_ip_address():
@@ -218,7 +219,8 @@ def distribute_workload(current, executor):
                 end = start + batch_size - 1
                 futures.append(executor.submit(assign_ranges_to_slave, slave_ip, start, end))
                 current = end + 1
-        futures.append(executor.submit(calculate_primes_master, current, current + INITIAL_BATCH_SIZE - 1))
+        if server_calculations:
+            futures.append(executor.submit(calculate_primes_master, current, current + INITIAL_BATCH_SIZE - 1))
         for future in as_completed(futures):
             if future.exception() is None:
                 result = future.result()
@@ -246,6 +248,8 @@ def broadcast_and_serve_slave():
 if __name__ == "__main__":
     mode = int(input("1. Master\n2. Slave\nChoose mode: "))
     if mode == 1:
+        calculate_option = input("Should the master perform calculations too? (y/n): ").strip().lower()
+        server_calculations = calculate_option == 'y'
         start_master()
     elif mode == 2:
         broadcast_and_serve_slave()
